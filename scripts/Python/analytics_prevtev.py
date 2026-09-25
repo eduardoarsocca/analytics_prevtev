@@ -22,7 +22,7 @@ import streamlit as st
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EXPORT_SCRIPT = PROJECT_ROOT / "scripts" / "Python" / "export.py"
 EXPORT_JSON = PROJECT_ROOT / "export" / "export.json"
 
