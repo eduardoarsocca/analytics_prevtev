@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# Dados gerados (export do Firestore)
+export/export.json

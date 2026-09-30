@@ -9,14 +9,13 @@ import json
 import logging
 import subprocess
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -27,6 +26,15 @@ EXPORT_SCRIPT = PROJECT_ROOT / "scripts" / "Python" / "export.py"
 EXPORT_JSON = PROJECT_ROOT / "export" / "export.json"
 
 COLORS = ["#EC0E73", "#041266", "#C830A0", "#FAAFB1"]
+CALCULADORAS = ["SCORE Caprini", "Padua", "Improve", "ImproveDD", "RCOG"]
+# (rótulo, palavras-chave p/ localizar a pergunta, tipo de gráfico)
+SOCIO_DEMO_CONFIG = [
+    ("Sexo", ["sexo"], "pie"),
+    ("Idade", ["idade"], "bar"),
+    ("Altura", ["altura"], "hist"),
+    ("Peso", ["peso"], "hist"),
+    ("IMC / Obesidade", ["imc", "obesidade"], "bar"),
+]
 
 st.set_page_config(page_title="Analytics PREVTEV", layout="wide")
 
@@ -54,57 +62,6 @@ def run_export() -> tuple[bool, str]:
 def load_raw_data(json_path: str, mtime: float) -> dict:
     with open(json_path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def parse_prevtev_json(file_path: Path) -> Optional[pd.DataFrame]:
-    """Lê o export.json da PREVTEV e retorna um DataFrame unificado normalizado."""
-    if not file_path.exists():
-        logger.error("Arquivo não encontrado: %s", file_path)
-        return None
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    users_data = data.get("usuarios", {})
-    if not users_data:
-        logger.warning("Nenhum registro de usuário encontrado no JSON.")
-        return pd.DataFrame()
-
-    processed_rows = []
-    for user_id, user_info in users_data.items():
-        row = {
-            "user_id": user_id,
-            "nomeCompleto": user_info.get("nomeCompleto"),
-            "email": user_info.get("email"),
-            "profissionalSaude": user_info.get("profissionalSaude"),
-            "crmCpf": user_info.get("crmCpf"),
-            "isAceitoLGPD": user_info.get("isAceitoLGPD"),
-            "nomeCalculadora": user_info.get("nomeCalculadora"),
-            "preenchimento_dt": (
-                pd.to_datetime(user_info.get("createdAt"), format="ISO8601", errors="coerce").strftime("%Y-%m-%d")
-                if user_info.get("createdAt")
-                else None
-            ),
-            "resultado": user_info.get("resultado"),
-        }
-
-        for q in user_info.get("questions", []):
-            q_title = q.get("question")
-            if not q_title:
-                continue
-            if "selectedOption" in q:
-                row[q_title] = q.get("selectedOption")
-            elif "selectedValue" in q:
-                row[q_title] = q.get("selectedValue")
-            elif "subQuestions" in q:
-                selected = [sub.get("text") for sub in q.get("subQuestions", []) if sub.get("selected") == "Sim"]
-                row[q_title] = ", ".join(selected) if selected else "Nenhum"
-
-        processed_rows.append(row)
-
-    df = pd.DataFrame(processed_rows)
-    logger.info("Sucesso: %d registros processados e normalizados", len(df))
-    return df
 
 
 def build_df_usuarios(data: dict) -> pd.DataFrame:
@@ -145,16 +102,32 @@ def build_resultado(df_usuarios: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── Seções da página ──────────────────────────────────────────────────────────
-def secao_lista_medicos(df_usuarios: pd.DataFrame) -> None:
-    st.header("1. Lista de Médicos")
-
-    df_lista_medicos = df_usuarios[
+# 3. Lista de médicos
+def filtrar_medicos_unicos(df_usuarios: pd.DataFrame) -> pd.DataFrame:
+    """Retorna apenas profissionais de saúde com email válido, deduplicados por crmCpf."""
+    df_medicos = df_usuarios[
         ["user_id", "nomeCompleto", "email", "profissionalSaude", "crmCpf", "nomeCalculadora", "preenchimento_dt"]
     ].copy()
-    df_lista_medicos = df_lista_medicos[df_lista_medicos["profissionalSaude"] == True]  # noqa: E712
-    df_lista_medicos = df_lista_medicos[df_lista_medicos["email"].notnull()]
-    df_lista_medicos = df_lista_medicos[df_lista_medicos["email"] != "NI"]
-    df_lista_medicos = df_lista_medicos.drop_duplicates(subset="crmCpf", keep="first")
+    df_medicos = df_medicos[df_medicos["profissionalSaude"] == True]  # noqa: E712
+    df_medicos = df_medicos[df_medicos["email"].notnull()]
+    df_medicos = df_medicos[df_medicos["email"] != "NI"]
+    df_medicos = df_medicos.drop_duplicates(subset="crmCpf", keep="first")
+    return df_medicos
+
+
+def secao_lista_medicos(df_usuarios: pd.DataFrame) -> None:
+    st.header("3. Lista de Médicos")
+
+    st.subheader("3.1 Médicos únicos (deduplicados por CRM/CPF)")
+    df_lista_medicos = filtrar_medicos_unicos(df_usuarios)
+    df_lista_medicos = df_lista_medicos.drop(columns=["user_id", "nomeCalculadora"])
+    df_lista_medicos = df_lista_medicos.rename(columns={
+        "nomeCompleto": "Nome Completo",
+        "email": "Email",
+        "profissionalSaude": "Profissional de Saúde",
+        "crmCpf": "CRM/CPF",
+        "preenchimento_dt": "Data de Preenchimento",
+    })
 
     st.dataframe(df_lista_medicos, width='stretch')
 
@@ -165,210 +138,174 @@ def secao_lista_medicos(df_usuarios: pd.DataFrame) -> None:
         data=buffer.getvalue(),
         file_name=f"lista_medicos_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_medicos_unicos",
     )
 
+    st.subheader("3.2 Todos os registros (sem exclusão de duplicatas)")
+    df_todos_registros = df_usuarios[
+        ["user_id", "nomeCompleto", "email", "profissionalSaude", "crmCpf", "nomeCalculadora", "preenchimento_dt"]
+    ].copy()
+    df_todos_registros = df_todos_registros.rename(columns={
+        "user_id": "Usuário",
+        "nomeCompleto": "Nome Completo",
+        "email": "Email",
+        "profissionalSaude": "Profissional de Saúde",
+        "crmCpf": "CRM/CPF",
+        "nomeCalculadora": "Score",
+        "preenchimento_dt": "Data de Preenchimento",
+    })
 
-def secao_dataset_calculadoras(export_json_path: Path) -> None:
+    st.dataframe(df_todos_registros, width='stretch')
+
+    buffer_todos = BytesIO()
+    df_todos_registros.to_excel(buffer_todos, index=False)
+    st.download_button(
+        "Baixar todos os registros (.xlsx)",
+        data=buffer_todos.getvalue(),
+        file_name=f"todos_registros_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_todos_registros",
+    )
+
+# 2. gráfico de barras número de registros por calculadora
+def secao_dataset_calculadoras(df_usuarios: pd.DataFrame) -> None:
     st.header("2. Dataset de uso e de respostas")
 
-    df_all = parse_prevtev_json(export_json_path)
-    if df_all is None or df_all.empty:
-        st.warning("Nenhum dado disponível para montar o dataset de calculadoras.")
+    if df_usuarios.empty:
+        st.warning("Nenhum dado disponível para montar o dataset de calculadoras no período selecionado.")
         return
 
-    nomes = ["SCORE Caprini", "Padua", "Improve", "ImproveDD", "RCOG"]
     resumo = []
-    for nome in nomes:
-        df_calc = df_all[df_all["nomeCalculadora"] == nome].dropna(axis=1, how="all")
-        resumo.append({"Calculadora": nome, "Registros": len(df_calc), "Colunas": df_calc.shape[1]})
+    for nome in CALCULADORAS:
+        resumo.append({"Calculadora": nome, "Registros": int((df_usuarios["nomeCalculadora"] == nome).sum())})
 
     st.dataframe(pd.DataFrame(resumo), width='stretch', hide_index=True)
 
 
-def secao_perfil_etario(caprini: pd.DataFrame) -> None:
-    st.subheader("a. Perfil etário dos pacientes")
+# 1. cards com indicadores gerais do período selecionado
+def secao_analytics_gerais(df_usuarios: pd.DataFrame) -> None:
+    st.header("1. Analytics Gerais")
 
-    caprini_idade = caprini[caprini["question"] == "Idade (Anos)"].copy()
-    caprini_idade["Answer"] = caprini_idade["Answer"].astype(str)
+    if df_usuarios.empty:
+        st.warning("Nenhum dado disponível para o período selecionado.")
+        return
 
-    idade_counts = caprini_idade["Answer"].value_counts().sort_index()
-    fig = px.bar(
-        x=idade_counts.index,
-        y=idade_counts.values,
-        color=idade_counts.index,
-        color_discrete_sequence=COLORS,
-    )
+    contagem_calc = df_usuarios["nomeCalculadora"].value_counts()
+    contagem_calc = contagem_calc.reindex(CALCULADORAS, fill_value=0)
+    mais_consumida = contagem_calc.idxmax()
+    menos_consumida = contagem_calc.idxmin()
+
+    # pico considera apenas médicos únicos e válidos (mesmo critério da Lista de Médicos)
+    df_medicos = filtrar_medicos_unicos(df_usuarios)
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Número de acessos (total)", len(df_usuarios))
+    col2.metric("Calculadora mais consumida", mais_consumida, f"{contagem_calc[mais_consumida]} registros")
+    col3.metric("Calculadora menos consumida", menos_consumida, f"{contagem_calc[menos_consumida]} registros")
+
+    if df_medicos.empty:
+        col4.metric("Pico de atividade", "—")
+    else:
+        datas_sem_horario = df_medicos["preenchimento_dt"].dt.normalize()
+        contagem_por_dia = datas_sem_horario.value_counts()
+        pico_dia = contagem_por_dia.idxmax()
+        col4.metric("Pico de atividade", pico_dia.strftime("%d/%m/%Y"), f"{contagem_por_dia[pico_dia]} médicos")
+
+
+def _match_question(perguntas: list[str], keywords: list[str]) -> Optional[str]:
+    """Retorna a primeira pergunta cujo texto contenha alguma das keywords."""
+    for pergunta in perguntas:
+        low = pergunta.lower()
+        if any(keyword in low for keyword in keywords):
+            return pergunta
+    return None
+
+
+def plot_bar_pergunta(df_calc: pd.DataFrame, question: str, titulo: str, eixo_x: str) -> None:
+    sub = df_calc[df_calc["question"] == question].copy()
+    sub["Answer"] = sub["Answer"].astype(str)
+    contagem = sub["Answer"].value_counts()
+    contagem_numerica = pd.to_numeric(contagem.index.to_series(), errors="coerce")
+    if contagem_numerica.notna().all():
+        contagem = contagem.loc[contagem_numerica.sort_values().index]
+    else:
+        contagem = contagem.sort_index()
+
+    fig = px.bar(x=contagem.index, y=contagem.values, color=contagem.index, color_discrete_sequence=COLORS)
     fig.update_layout(
-        title="Perfil etário dos pacientes avaliados com o Escore Caprini",
-        xaxis_title="Idade (Anos)",
+        title=titulo,
+        xaxis_title=eixo_x,
         yaxis_title="Pacientes (n)",
         xaxis_tickangle=-45,
-        bargap=0.0,
-        showlegend=True,
-        legend_title_text="Idade (Anos)",
+        showlegend=False,
     )
     fig.update_traces(texttemplate="%{y}", textposition="outside")
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(showgrid=False)
     st.plotly_chart(fig, width='stretch')
 
-    st.markdown("###### I. Perfil etário dos pacientes ao longo do tempo")
-    preenchimentos_idade_tempo = (
-        caprini_idade[["user_id", "mes_ano", "Answer"]].groupby(["mes_ano", "Answer"]).size().reset_index(name="Frequência")
-    )
-    fig = px.line(
-        preenchimentos_idade_tempo,
-        x="mes_ano",
-        y="Frequência",
-        color="Answer",
-        markers=True,
-        color_discrete_sequence=COLORS,
-    )
-    fig.update_layout(
-        title="Evolução do número de preenchimentos do Escore Caprini por faixa etária",
-        xaxis_title="Período",
-        yaxis_title="Pacientes (n)",
-        xaxis_tickangle=-45,
-        legend_title_text="Idade (Anos)",
-    )
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(showgrid=False)
-    st.plotly_chart(fig, width='stretch')
 
-    st.markdown("###### Perfil etário dos pacientes por resultado do score")
-    caprini_resultado_idade_perfil = (
-        caprini_idade.groupby(["Answer", "resultado"]).size().reset_index(name="Frequência")
-    )
-
-    fig = px.bar(
-        caprini_resultado_idade_perfil,
-        x="resultado",
-        y="Frequência",
-        color="Answer",
-        color_discrete_sequence=COLORS,
-        barmode="stack",
-    )
-    fig.update_layout(
-        title="Distribuição dos resultados do Escore Caprini por faixa etária",
-        xaxis_title="Resultado",
-        yaxis_title="Pacientes (n)",
-        xaxis_tickangle=-45,
-        legend_title_text="Idade (Anos)",
-    )
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(showgrid=False)
-    st.plotly_chart(fig, width='stretch')
-
-    st.markdown("###### Perfil de cada faixa etária ao longo do tempo")
-    frequencia_40menos = caprini_idade.groupby(["resultado", "mes_ano"]).size().reset_index(name="Frequência")
-    fig = px.bar(
-        frequencia_40menos,
-        x="mes_ano",
-        y="Frequência",
-        color="resultado",
-        color_discrete_sequence=px.colors.sequential.Viridis,
-        barmode="stack",
-    )
-    st.plotly_chart(fig, width='stretch')
-
-
-def secao_perfil_genero(caprini: pd.DataFrame) -> None:
-    st.subheader("b. Perfil de Gênero dos pacientes")
-
-    caprini_sexo = caprini[caprini["question"] == "Sexo"].copy()
-    caprini_sexo["Answer"] = caprini_sexo["Answer"].astype(str)
-    frequencia_sexo = caprini_sexo["Answer"].value_counts().reset_index()
-    frequencia_sexo.columns = ["Sexo", "Frequência"]
+def plot_pie_pergunta(df_calc: pd.DataFrame, question: str, titulo: str) -> None:
+    sub = df_calc[df_calc["question"] == question].copy()
+    sub["Answer"] = sub["Answer"].astype(str)
+    contagem = sub["Answer"].value_counts().reset_index()
+    contagem.columns = ["Resposta", "Frequência"]
 
     fig = px.pie(
-        frequencia_sexo,
-        names="Sexo",
+        contagem,
+        names="Resposta",
         values="Frequência",
-        color="Sexo",
+        color="Resposta",
         color_discrete_sequence=COLORS,
     )
-    fig.update_layout(title="Perfil de gênero dos pacientes avaliados com o Escore Caprini")
+    fig.update_layout(title=titulo)
     st.plotly_chart(fig, width='stretch')
 
 
-def secao_tipo_cirurgia(caprini: pd.DataFrame) -> None:
-    st.subheader("c. Tipo de cirurgia")
-
-    caprini_tipo_cirurgia = caprini[caprini["question"] == "Tipo de cirurgia"].copy()
-    caprini_tipo_cirurgia["Answer"] = caprini_tipo_cirurgia["Answer"].astype(str)
-    frequencia_tipo_cirurgia = caprini_tipo_cirurgia["Answer"].value_counts().reset_index()
-    frequencia_tipo_cirurgia.columns = ["Tipo de Cirurgia", "Frequência"]
-
-    col1, col2 = st.columns(2)
-    with col1:
-        fig = px.bar(
-            frequencia_tipo_cirurgia,
-            x="Tipo de Cirurgia",
-            y="Frequência",
-            color="Tipo de Cirurgia",
-            color_discrete_sequence=COLORS,
-        )
-        fig.update_layout(
-            title="Frequência de pacientes por tipo de cirurgia",
-            xaxis_title="Tipo de Cirurgia",
-            yaxis_title="Pacientes (n)",
-        )
-        fig.update_traces(texttemplate="%{y}", textposition="outside")
-        fig.update_xaxes(showgrid=False)
-        fig.update_yaxes(showgrid=False)
-        st.plotly_chart(fig, width='stretch')
-
-    with col2:
-        fig = go.Figure(
-            data=[
-                go.Pie(
-                    labels=frequencia_tipo_cirurgia["Tipo de Cirurgia"],
-                    values=frequencia_tipo_cirurgia["Frequência"],
-                    hole=0.5,
-                    marker_colors=COLORS,
-                )
-            ]
-        )
-        fig.update_layout(title="Distribuição do tipo de cirurgia")
-        st.plotly_chart(fig, width='stretch')
-
-
-def secao_mobilidade(caprini: pd.DataFrame) -> None:
-    st.subheader("d. Mobilidade")
-
-    caprini_mobilidade = caprini[caprini["question"] == "Mobilidade"].copy()
-    caprini_mobilidade["Answer"] = caprini_mobilidade["Answer"].astype(str)
-    frequencia_mobilidade = caprini_mobilidade["Answer"].value_counts().reset_index()
-    frequencia_mobilidade.columns = ["Mobilidade", "Frequência"]
-
-    fig = go.Figure(
-        data=[
-            go.Pie(
-                labels=frequencia_mobilidade["Mobilidade"],
-                values=frequencia_mobilidade["Frequência"],
-                hole=0.5,
-                marker_colors=COLORS,
-            )
-        ]
-    )
-    fig.update_layout(title="Avaliação de mobilidade dos pacientes avaliados com o Escore Caprini")
-    st.plotly_chart(fig, width='stretch')
-
-
-def secao_escore_caprini(resultado: pd.DataFrame) -> None:
-    st.header("3. Escore de Caprini")
-
-    caprini = resultado[resultado["nomeCalculadora"] == "SCORE Caprini"].copy()
-    if caprini.empty:
-        st.warning("Nenhum registro do Escore Caprini encontrado no período selecionado.")
+def plot_hist_pergunta(df_calc: pd.DataFrame, question: str, titulo: str, eixo_x: str) -> None:
+    sub = df_calc[df_calc["question"] == question].copy()
+    sub["Answer_num"] = pd.to_numeric(sub["Answer"], errors="coerce")
+    sub = sub.dropna(subset=["Answer_num"])
+    if sub.empty:
+        plot_bar_pergunta(df_calc, question, titulo, eixo_x)
         return
 
-    caprini_serie_temporal_frequencia = (
-        caprini[["user_id", "mes_ano"]].drop_duplicates().groupby("mes_ano").size().reset_index(name="Frequência")
+    fig = px.histogram(sub, x="Answer_num", color_discrete_sequence=COLORS)
+    fig.update_layout(title=titulo, xaxis_title=eixo_x, yaxis_title="Pacientes (n)")
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=False)
+    st.plotly_chart(fig, width='stretch')
+
+
+def secao_dados_sociodemograficos(df_calc: pd.DataFrame) -> None:
+    st.markdown("#### 4.1 Dados sócio-demográficos")
+
+    perguntas = df_calc["question"].dropna().unique().tolist()
+    encontrou_algum = False
+    for label, keywords, tipo in SOCIO_DEMO_CONFIG:
+        question = _match_question(perguntas, keywords)
+        if not question:
+            continue
+        encontrou_algum = True
+        if tipo == "pie":
+            plot_pie_pergunta(df_calc, question, f"Distribuição por {label}")
+        elif tipo == "hist":
+            plot_hist_pergunta(df_calc, question, f"Distribuição de {label}", label)
+        else:
+            plot_bar_pergunta(df_calc, question, f"Distribuição por {label}", label)
+
+    if not encontrou_algum:
+        st.info("Nenhum dado sócio-demográfico disponível para esta calculadora.")
+
+
+def secao_analytics_calculadora(df_calc: pd.DataFrame, nome_calculadora: str) -> None:
+    st.markdown("#### 4.2 Analytics da calculadora selecionada")
+
+    serie_temporal = (
+        df_calc[["user_id", "mes_ano"]].drop_duplicates().groupby("mes_ano").size().reset_index(name="Frequência")
     )
-    fig = px.line(caprini_serie_temporal_frequencia, x="mes_ano", y="Frequência")
+    fig = px.line(serie_temporal, x="mes_ano", y="Frequência")
     fig.update_layout(
-        title="Utilização do Escore Caprini ao longo do tempo",
+        title=f"Utilização de {nome_calculadora} ao longo do tempo",
         xaxis_title="Período",
         yaxis_title="Frequência",
     )
@@ -377,10 +314,69 @@ def secao_escore_caprini(resultado: pd.DataFrame) -> None:
     fig.update_yaxes(showgrid=False)
     st.plotly_chart(fig, width='stretch')
 
-    secao_perfil_etario(caprini)
-    secao_perfil_genero(caprini)
-    secao_tipo_cirurgia(caprini)
-    secao_mobilidade(caprini)
+    perguntas = df_calc["question"].dropna().unique().tolist()
+    perguntas_sociodemo = {_match_question(perguntas, keywords) for _, keywords, _ in SOCIO_DEMO_CONFIG}
+    perguntas_restantes = sorted(p for p in perguntas if p not in perguntas_sociodemo)
+
+    if not perguntas_restantes:
+        st.info("Nenhuma outra pergunta disponível para esta calculadora.")
+        return
+
+    for question in perguntas_restantes:
+        plot_bar_pergunta(df_calc, question, question, question)
+
+
+def secao_score_analytics(resultado: pd.DataFrame) -> None:
+    st.header("4. Score Analytics")
+    st.write("Selecione a calculadora deseja analisar")
+
+    if "calculadora_selecionada" not in st.session_state:
+        st.session_state["calculadora_selecionada"] = None
+
+    cols = st.columns(len(CALCULADORAS))
+    for col, nome in zip(cols, CALCULADORAS):
+        with col:
+            selecionada = st.session_state["calculadora_selecionada"] == nome
+            if st.button(
+                nome, key=f"btn_calc_{nome}", width='stretch', type="primary" if selecionada else "secondary"
+            ):
+                st.session_state["calculadora_selecionada"] = nome
+
+    nome_selecionado = st.session_state["calculadora_selecionada"]
+    if not nome_selecionado:
+        return
+
+    df_calc = resultado[resultado["nomeCalculadora"] == nome_selecionado].copy()
+    if df_calc.empty:
+        st.warning(f"Nenhum registro de {nome_selecionado} encontrado no período selecionado.")
+        return
+
+    secao_dados_sociodemograficos(df_calc)
+    secao_analytics_calculadora(df_calc, nome_selecionado)
+
+
+PRESETS_PERIODO = ["Todo o período", "Esta semana", "Este mês", "Mês anterior", "Este ano", "Personalizado"]
+
+
+def _calcular_preset_periodo(preset: str, data_min: date, data_max: date) -> tuple[date, date]:
+    """Calcula (início, fim) para um preset, limitado ao intervalo real dos dados."""
+    hoje = datetime.now().date()
+    if preset == "Todo o período":
+        inicio, fim = data_min, min(data_max, hoje)
+    elif preset == "Esta semana":
+        inicio, fim = hoje - timedelta(days=hoje.weekday()), hoje
+    elif preset == "Este mês":
+        inicio, fim = hoje.replace(day=1), hoje
+    elif preset == "Mês anterior":
+        fim = hoje.replace(day=1) - timedelta(days=1)
+        inicio = fim.replace(day=1)
+    elif preset == "Este ano":
+        inicio, fim = hoje.replace(month=1, day=1), hoje
+    else:
+        return data_min, data_max
+
+    inicio, fim = max(inicio, data_min), min(fim, data_max)
+    return (data_min, data_max) if inicio > fim else (inicio, fim)
 
 
 # ── Página principal ───────────────────────────────────────────────────────
@@ -408,11 +404,39 @@ def main() -> None:
 
     data = load_raw_data(str(EXPORT_JSON), EXPORT_JSON.stat().st_mtime)
     df_usuarios = build_df_usuarios(data)
+
+    if df_usuarios.empty:
+        st.warning("Nenhum registro disponível.")
+        return
+
+    data_min = df_usuarios["preenchimento_dt"].min().date()
+    data_max = df_usuarios["preenchimento_dt"].max().date()
+    with st.sidebar:
+        st.header("Período")
+        preset = st.radio("Período de análise", options=PRESETS_PERIODO, index=0, key="preset_periodo")
+
+        if preset == "Personalizado":
+            intervalo = st.date_input(
+                "Data de preenchimento",
+                value=(data_min, data_max),
+                min_value=data_min,
+                max_value=data_max,
+            )
+            inicio, fim = intervalo if isinstance(intervalo, tuple) and len(intervalo) == 2 else (data_min, data_max)
+        else:
+            inicio, fim = _calcular_preset_periodo(preset, data_min, data_max)
+            st.caption(f"Período: {inicio.strftime('%d/%m/%Y')} a {fim.strftime('%d/%m/%Y')}")
+
+    df_usuarios = df_usuarios[
+        (df_usuarios["preenchimento_dt"] >= pd.Timestamp(inicio))
+        & (df_usuarios["preenchimento_dt"] <= pd.Timestamp(fim))
+    ]
     resultado = build_resultado(df_usuarios)
 
+    secao_analytics_gerais(df_usuarios)
+    secao_dataset_calculadoras(df_usuarios)
     secao_lista_medicos(df_usuarios)
-    secao_dataset_calculadoras(EXPORT_JSON)
-    secao_escore_caprini(resultado)
+    secao_score_analytics(resultado)
 
 
 if __name__ == "__main__":
